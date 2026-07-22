@@ -1,0 +1,10 @@
+[project]
+name = "gamemaptracker"
+version = "0.1.0"
+description = "Exanima player movement tracker - reads XY coordinates from game memory and plots paths"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = ["PySide6"]
+
+[project.scripts]
+gamemaptracker = "main:main"
