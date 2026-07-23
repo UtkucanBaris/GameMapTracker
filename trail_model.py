@@ -29,7 +29,7 @@ class POI:
         return f"({self.x:.1f}, {self.y:.1f})"
 
 
-MIN_DISTANCE = 50.0
+MIN_DISTANCE = 28.0
 TELEPORT_THRESHOLD = 2000.0
 
 

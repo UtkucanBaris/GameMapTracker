@@ -41,8 +41,12 @@ FOLLOW_ZOOM_TRAIL_PAD = 1.85
 FOLLOW_IDLE_SEC = 0.35
 FOLLOW_MOVE_THRESH_GAME = 12.0
 POI_POLAR_BINS = 40
-POI_BIN_DIST_SLACK = 1.1
-POI_BIN_DIST_ADD = MIN_DISTANCE * 0.25
+POI_BIN_DIST_SLACK = 1.02
+POI_BIN_DIST_ADD = MIN_DISTANCE * 0.08
+POI_RING_COVERAGE_MIN = 0.62
+POI_RING_CLOSE_COVERAGE = 0.78
+POI_OPEN_ARC_MAX = 200.0
+POI_OPEN_DIST_SLACK = 1.025
 POI_MARKER_RADIUS_PX = 14.0
 LIVE_BOOTSTRAP_PAD = 400.0
 PADDING = 20.0
@@ -166,6 +170,82 @@ def _polar_bin_index(poi_x: float, poi_y: float, cx: float, cy: float) -> int:
     return int(ang / (2 * math.pi) * POI_POLAR_BINS) % POI_POLAR_BINS
 
 
+def _segment_dist_to_poi(
+    poi_x: float, poi_y: float, x1: float, y1: float, x2: float, y2: float
+) -> float:
+    return math.sqrt(_dist_sq_point_to_segment(poi_x, poi_y, x1, y1, x2, y2))
+
+
+def _path_segment_dists(
+    poi_x: float, poi_y: float, verts: list[tuple[float, float]]
+) -> list[float]:
+    return [
+        _segment_dist_to_poi(poi_x, poi_y, verts[i][0], verts[i][1], verts[i + 1][0], verts[i + 1][1])
+        for i in range(len(verts) - 1)
+    ]
+
+
+def _poi_angular_coverage(
+    poi_x: float, poi_y: float, verts: list[tuple[float, float]], max_dist: float
+) -> float:
+    bins_hit: set[int] = set()
+    for i in range(len(verts) - 1):
+        gx1, gy1 = verts[i]
+        gx2, gy2 = verts[i + 1]
+        d = _segment_dist_to_poi(poi_x, poi_y, gx1, gy1, gx2, gy2)
+        if d > max_dist:
+            continue
+        cx, cy, _ = _closest_point_on_segment(poi_x, poi_y, gx1, gy1, gx2, gy2)
+        bins_hit.add(_polar_bin_index(poi_x, poi_y, cx, cy))
+    return len(bins_hit) / POI_POLAR_BINS
+
+
+def _poi_open_contiguous_pick(
+    poi_x: float,
+    poi_y: float,
+    verts: list[tuple[float, float]],
+    extra_seg: tuple[float, float, float, float] | None,
+) -> tuple[set[int], bool, bool]:
+    """Trail does not wrap POI: highlight only a contiguous run along the path."""
+    nseg = len(verts) - 1
+    if nseg < 1:
+        return set(), False, False
+    seg_d = _path_segment_dists(poi_x, poi_y, verts)
+    best_i = min(range(nseg), key=lambda i: seg_d[i])
+    d0 = seg_d[best_i]
+    cap = d0 * POI_OPEN_DIST_SLACK + MIN_DISTANCE * 0.12
+    chosen = {best_i}
+    acc = 0.0
+    for i in range(best_i - 1, -1, -1):
+        if seg_d[i] > cap:
+            break
+        dx = verts[i + 1][0] - verts[i][0]
+        dy = verts[i + 1][1] - verts[i][1]
+        acc += math.sqrt(dx * dx + dy * dy)
+        if acc > POI_OPEN_ARC_MAX:
+            break
+        chosen.add(i)
+    acc = 0.0
+    for i in range(best_i + 1, nseg):
+        if seg_d[i] > cap:
+            break
+        dx = verts[i + 1][0] - verts[i][0]
+        dy = verts[i + 1][1] - verts[i][1]
+        acc += math.sqrt(dx * dx + dy * dy)
+        if acc > POI_OPEN_ARC_MAX:
+            break
+        chosen.add(i)
+
+    draw_extra = False
+    if extra_seg is not None:
+        d_ex = _segment_dist_to_poi(
+            poi_x, poi_y, extra_seg[0], extra_seg[1], extra_seg[2], extra_seg[3]
+        )
+        if d_ex <= cap:
+            draw_extra = True
+    return chosen, False, draw_extra
+
+
 def _poi_polar_nearest_segment_pick(
     poi_x: float,
     poi_y: float,
@@ -180,6 +260,16 @@ def _poi_polar_nearest_segment_pick(
     if nseg < 1 and extra_seg is None:
         return set(), False, False
 
+    seg_d = _path_segment_dists(poi_x, poi_y, verts) if nseg >= 1 else []
+    d_min = min(seg_d) if seg_d else float("inf")
+    ring_probe = d_min * POI_BIN_DIST_SLACK + POI_BIN_DIST_ADD + MIN_DISTANCE
+    coverage = _poi_angular_coverage(poi_x, poi_y, verts, ring_probe) if nseg >= 1 else 0.0
+
+    if coverage < POI_RING_COVERAGE_MIN:
+        return _poi_open_contiguous_pick(poi_x, poi_y, verts, extra_seg)
+
+    allow_close = coverage >= POI_RING_CLOSE_COVERAGE
+
     bins: dict[int, list[tuple[str, int, float]]] = {}
 
     def _add(seg_kind: str, seg_i: int, x1: float, y1: float, x2: float, y2: float) -> None:
@@ -192,7 +282,7 @@ def _poi_polar_nearest_segment_pick(
         gx2, gy2 = verts[i + 1]
         _add("path", i, gx1, gy1, gx2, gy2)
 
-    if len(verts) >= 3:
+    if len(verts) >= 3 and allow_close:
         perim = _path_perimeter(verts)
         gap = _path_gap(verts)
         if gap <= perim * 0.28:
@@ -205,8 +295,8 @@ def _poi_polar_nearest_segment_pick(
     draw_close = False
     draw_extra = False
     for items in bins.values():
-        d_min = min(d for _, _, d in items)
-        cap = d_min * POI_BIN_DIST_SLACK + POI_BIN_DIST_ADD
+        bin_min = min(d for _, _, d in items)
+        cap = bin_min * POI_BIN_DIST_SLACK + POI_BIN_DIST_ADD
         for kind, idx, d in items:
             if d > cap:
                 continue
@@ -216,6 +306,7 @@ def _poi_polar_nearest_segment_pick(
                 draw_close = True
             elif kind == "extra":
                 draw_extra = True
+
     return chosen, draw_close, draw_extra
 
 
@@ -1100,6 +1191,24 @@ class GraphRenderer(QObject):
     def _pan_to_marker(self, mp: QPointF) -> None:
         self._view.centerOn(mp)
 
+    def _sync_live_tail_line(self) -> None:
+        if self._incr_prev is None:
+            return
+        mp = self._live_marker.pos()
+        dx = mp.x() - self._incr_prev[0]
+        dy = mp.y() - self._incr_prev[1]
+        if dx * dx + dy * dy < 1.0:
+            self._tail_line_item.setVisible(False)
+            return
+        tail = QPainterPath()
+        tail.moveTo(self._incr_prev[0], self._incr_prev[1])
+        tail.lineTo(mp.x(), mp.y())
+        self._tail_line_item.setPath(tail)
+        self._tail_line_item.setVisible(True)
+        c = QColor(PATH_COLORS[self._incr_path_count % len(PATH_COLORS)])
+        c.setAlpha(120)
+        self._tail_line_item.setPen(QPen(c, 1.5, Qt.SolidLine))
+
     def update_live_marker(self, x: float, y: float, instant: bool = False) -> None:
         if not math.isfinite(x) or not math.isfinite(y):
             return
@@ -1113,6 +1222,7 @@ class GraphRenderer(QObject):
         sx, sy = self._tc.game_to_screen(x, y)
         self._live_marker.setVisible(True)
         self.set_smooth_marker_target(sx, sy, instant=instant)
+        self._sync_live_tail_line()
         if bounds_changed and not self._suppress_bounds_signal:
             self.bounds_expanded.emit()
         if self._cached_pois:
@@ -1153,6 +1263,17 @@ class GraphRenderer(QObject):
                 self._trail_pts = [self._incr_prev]
             self._trail_pts.append(pt)
             n = len(self._trail_pts)
+
+            if n == 2:
+                if self._active_path is None:
+                    self._active_path = QPainterPath()
+                    self._active_path.moveTo(*self._trail_pts[0])
+                    self._active_path_item = QGraphicsPathItem(self._active_path)
+                    self._active_path_item.setPen(_path_color(self._incr_path_count))
+                    _init_trail_path_item(self._active_path_item)
+                    self._scene.addItem(self._active_path_item)
+                self._active_path.lineTo(*self._trail_pts[1])
+                self._active_path_item.setPath(self._active_path)
 
             # Segment P[n-3] → P[n-2] is finalized once next point provides context
             if n >= 3:
@@ -1209,14 +1330,7 @@ class GraphRenderer(QObject):
         dt = min(max(dt, 0.001), 0.1)
         self._update_smooth_marker(dt)
 
-        # Update tail line anchor → smooth marker
-        if self._tail_line_item.isVisible() and len(self._trail_pts) >= 2:
-            anchor = self._trail_pts[-2]
-            mp = self._live_marker.pos()
-            tail = QPainterPath()
-            tail.moveTo(*anchor)
-            tail.lineTo(mp.x(), mp.y())
-            self._tail_line_item.setPath(tail)
+        self._sync_live_tail_line()
 
         mp = self._live_marker.pos()
         following = self._follow_active or self._follow_zoom_enabled
