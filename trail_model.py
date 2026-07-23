@@ -38,25 +38,41 @@ class TrailModel:
     paths: list[list[TrailPoint]] = field(default_factory=list)
     pois: list[POI] = field(default_factory=list)
     teleport_threshold: float = TELEPORT_THRESHOLD
+    _poll_prev: tuple[float, float] | None = field(default=None, repr=False)
+    _walk_since_add: float = field(default=0.0, repr=False)
+
+    def reset_live_sampling(self) -> None:
+        self._poll_prev = None
+        self._walk_since_add = 0.0
 
     def start_new_path(self) -> None:
         self.paths.append([])
+        self._walk_since_add = 0.0
 
     def add(self, x: float, y: float) -> bool:
         if not math.isfinite(x) or not math.isfinite(y):
             return False
+        if self._poll_prev is not None:
+            self._walk_since_add += math.hypot(
+                x - self._poll_prev[0], y - self._poll_prev[1]
+            )
+        self._poll_prev = (x, y)
+
         if not self.paths:
             self.paths.append([])
         current = self.paths[-1]
         if current:
             last = current[-1]
             d2 = _squared_dist(last, (x, y))
-            if d2 < MIN_DISTANCE * MIN_DISTANCE:
+            direct_ok = d2 >= MIN_DISTANCE * MIN_DISTANCE
+            accum_ok = self._walk_since_add >= MIN_DISTANCE
+            if not direct_ok and not accum_ok:
                 return False
             if d2 > self.teleport_threshold * self.teleport_threshold:
                 self.start_new_path()
                 current = self.paths[-1]
         current.append(TrailPoint(x, y))
+        self._walk_since_add = 0.0
         return True
 
     def smooth(self, epsilon: float = 3.0) -> None:
@@ -135,6 +151,7 @@ class TrailModel:
     def clear(self) -> None:
         self.paths.clear()
         self.pois.clear()
+        self.reset_live_sampling()
 
 
 def _squared_dist(a: tuple[float, float], b: tuple[float, float]) -> float:

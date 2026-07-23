@@ -48,6 +48,7 @@ POI_RING_CLOSE_COVERAGE = 0.78
 POI_OPEN_ARC_MAX = 200.0
 POI_OPEN_DIST_SLACK = 1.025
 POI_MARKER_RADIUS_PX = 14.0
+ENABLE_POI_TRAIL_HIGHLIGHTS = False
 LIVE_BOOTSTRAP_PAD = 400.0
 PADDING = 20.0
 PATH_COLORS = [
@@ -106,9 +107,15 @@ def _heat_color(val: int) -> QRgb:
     return qRgba(r2, g2, b2, min(255, val + 60))
 
 
-def _path_color(index: int) -> QPen:
+def _path_color(index: int, width: float = 1.5) -> QPen:
     c = PATH_COLORS[index % len(PATH_COLORS)]
-    return QPen(c, 1.5, Qt.SolidLine)
+    return QPen(c, width, Qt.SolidLine)
+
+
+def _recording_path_pen(index: int) -> QPen:
+    pen = _path_color(index, 2.75)
+    pen.setCosmetic(True)
+    return pen
 
 
 def _init_trail_path_item(item: QGraphicsPathItem) -> None:
@@ -532,6 +539,7 @@ class GraphRenderer(QObject):
         self._poi_highlight_live_pos: tuple[float, float] | None = None
         self._prev_follow_game_pos: tuple[float, float] | None = None
         self._incr_prev: tuple[float, float] | None = None
+        self._trail_recording_active: bool = False
         self._incr_path_count: int = 0
         self._active_path: QPainterPath | None = None
         self._active_path_item: QGraphicsPathItem | None = None
@@ -542,12 +550,21 @@ class GraphRenderer(QObject):
         self._tail_line_item.setVisible(False)
         self._scene.addItem(self._tail_line_item)
 
+        self._lead_dot_item = QGraphicsEllipseItem(-3.5, -3.5, 7, 7)
+        self._lead_dot_item.setPen(DOT_PEN)
+        self._lead_dot_item.setBrush(DOT_BRUSH)
+        self._lead_dot_item.setZValue(5)
+        self._lead_dot_item.setVisible(False)
+        self._lead_dot_item.setFlag(QGraphicsItem.ItemIgnoresTransformations)
+        self._scene.addItem(self._lead_dot_item)
+
         self._live_dot_path = QPainterPath()
         self._live_dot_item = QGraphicsPathItem(self._live_dot_path)
         self._live_dot_item.setPen(Qt.NoPen)
         self._live_dot_item.setBrush(DOT_BRUSH)
-        self._live_dot_item.setZValue(1)
+        self._live_dot_item.setZValue(8)
         self._scene.addItem(self._live_dot_item)
+        self._recording_dot_items: list[QGraphicsEllipseItem] = []
 
         self._follow_timer.start()
         view.viewport().installEventFilter(self)
@@ -741,8 +758,7 @@ class GraphRenderer(QObject):
         self._active_path = None
         self._tail_line_item.setPath(QPainterPath())
         self._tail_line_item.setVisible(False)
-        self._live_dot_path = QPainterPath()
-        self._live_dot_item.setPath(self._live_dot_path)
+        self._clear_recording_dots()
         self._incr_prev = None
         self._incr_path_count = 0
         self._trail_pts.clear()
@@ -764,9 +780,13 @@ class GraphRenderer(QObject):
 
         self._cached_paths = paths
         self._cached_pois = list(pois)
-        self._render_poi_segment_highlights(paths, pois)
+        if ENABLE_POI_TRAIL_HIGHLIGHTS:
+            self._render_poi_segment_highlights(paths, pois)
 
-        self._sync_incremental_from_paths(paths)
+        if self._trail_recording_active:
+            self.rebuild_recording_trail(paths)
+        else:
+            self._sync_incremental_from_paths(paths)
 
         if self._last_game_pos is not None and self._tc.is_valid():
             sx, sy = self._tc.game_to_screen(*self._last_game_pos)
@@ -795,6 +815,139 @@ class GraphRenderer(QObject):
         gx, gy = self._game_xy(last_path[-1])
         sx, sy = self._tc.game_to_screen(gx, gy)
         self._incr_prev = (sx, sy)
+
+    def _clear_recording_dots(self) -> None:
+        for item in self._recording_dot_items:
+            self._scene.removeItem(item)
+        self._recording_dot_items.clear()
+        self._live_dot_path = QPainterPath()
+        self._live_dot_item.setPath(self._live_dot_path)
+
+    def _append_recording_dot(self, sx: float, sy: float) -> None:
+        dot = QGraphicsEllipseItem(-3.5, -3.5, 7, 7)
+        dot.setPos(sx, sy)
+        dot.setPen(DOT_PEN)
+        dot.setBrush(DOT_BRUSH)
+        dot.setFlag(QGraphicsItem.ItemIgnoresTransformations)
+        dot.setZValue(8)
+        self._scene.addItem(dot)
+        self._recording_dot_items.append(dot)
+
+    def _draw_static_path(self, pidx: int, path) -> None:
+        if len(path) < 2:
+            return
+        if self._fade_trail_enabled:
+            pts = [self._tc.game_to_screen(*self._game_xy(p)) for p in path]
+            for i in range(len(pts) - 1):
+                seg = QPainterPath()
+                seg.moveTo(pts[i][0], pts[i][1])
+                seg.lineTo(pts[i + 1][0], pts[i + 1][1])
+                alpha = 60 + int((i / max(1, len(pts) - 2)) * 195) if len(pts) > 2 else 255
+                c = QColor(PATH_COLORS[pidx % len(PATH_COLORS)])
+                c.setAlpha(alpha)
+                item = QGraphicsPathItem(seg)
+                item.setPen(QPen(c, 1.5, Qt.SolidLine))
+                _init_trail_path_item(item)
+                self._scene.addItem(item)
+                self._path_items.append(item)
+        else:
+            p = QPainterPath()
+            first = True
+            for pt in path:
+                sx, sy = self._tc.game_to_screen(*self._game_xy(pt))
+                if first:
+                    p.moveTo(sx, sy)
+                    first = False
+                else:
+                    p.lineTo(sx, sy)
+            item = QGraphicsPathItem(p)
+            item.setPen(_path_color(pidx))
+            _init_trail_path_item(item)
+            self._scene.addItem(item)
+            self._path_items.append(item)
+
+    def _add_static_dots(self, path) -> None:
+        for pt in path:
+            sx, sy = self._tc.game_to_screen(*self._game_xy(pt))
+            dot = QGraphicsEllipseItem(-3.5, -3.5, 7, 7)
+            dot.setPos(sx, sy)
+            dot.setPen(DOT_PEN)
+            dot.setBrush(DOT_BRUSH)
+            dot.setFlag(QGraphicsItem.ItemIgnoresTransformations)
+            dot.setZValue(8)
+            self._scene.addItem(dot)
+            self._dot_items.append(dot)
+
+    def _rebuild_active_path_from_screen_pts(
+        self, pts: list[tuple[float, float]], path_index: int
+    ) -> None:
+        if self._active_path_item is not None:
+            self._scene.removeItem(self._active_path_item)
+            self._active_path_item = None
+            self._active_path = None
+        if not pts:
+            return
+        self._active_path = QPainterPath()
+        self._active_path.moveTo(*pts[0])
+        n = len(pts)
+        if n == 2:
+            self._active_path.lineTo(*pts[1])
+        elif n >= 3:
+            for i in range(2, n):
+                p0 = pts[i - 3] if i >= 3 else pts[i - 2]
+                p1 = pts[i - 2]
+                p2 = pts[i - 1]
+                pt = pts[i]
+                c1x = p1[0] + (p2[0] - p0[0]) / 6
+                c1y = p1[1] + (p2[1] - p0[1]) / 6
+                c2x = p2[0] - (pt[0] - p1[0]) / 6
+                c2y = p2[1] - (pt[1] - p1[1]) / 6
+                self._active_path.cubicTo(c1x, c1y, c2x, c2y, *p2)
+        self._active_path_item = QGraphicsPathItem(self._active_path)
+        self._active_path_item.setPen(_recording_path_pen(path_index))
+        _init_trail_path_item(self._active_path_item)
+        self._scene.addItem(self._active_path_item)
+
+    def rebuild_recording_trail(self, paths) -> None:
+        if not self._tc.is_valid():
+            return
+        for item in self._path_items:
+            self._scene.removeItem(item)
+        self._path_items.clear()
+        for item in self._dot_items:
+            self._scene.removeItem(item)
+        self._dot_items.clear()
+
+        if not paths:
+            self._trail_pts.clear()
+            self._incr_prev = None
+            if self._active_path_item is not None:
+                self._scene.removeItem(self._active_path_item)
+                self._active_path_item = None
+                self._active_path = None
+            self._clear_recording_dots()
+            return
+
+        last_idx = len(paths) - 1
+        for pidx, path in enumerate(paths):
+            if not path:
+                continue
+            if pidx < last_idx:
+                self._draw_static_path(pidx, path)
+                self._add_static_dots(path)
+
+        self._incr_path_count = last_idx
+        current = paths[last_idx]
+        screen_pts = [
+            self._tc.game_to_screen(*self._game_xy(p)) for p in current
+        ]
+        self._trail_pts = screen_pts[:]
+        self._incr_prev = screen_pts[-1] if screen_pts else None
+        self._rebuild_active_path_from_screen_pts(screen_pts, last_idx)
+
+        self._clear_recording_dots()
+        for sx, sy in screen_pts:
+            self._append_recording_dot(sx, sy)
 
     def _update_smooth_marker(self, dt: float) -> None:
         if self._smooth_marker_target is None:
@@ -1032,10 +1185,12 @@ class GraphRenderer(QObject):
 
     def note_paths_for_poi_highlights(self, paths) -> None:
         self._cached_paths = paths
-        if self._cached_pois:
+        if ENABLE_POI_TRAIL_HIGHLIGHTS and self._cached_pois and not self._trail_recording_active:
             self._refresh_poi_highlights()
 
     def _refresh_poi_highlights(self) -> None:
+        if not ENABLE_POI_TRAIL_HIGHLIGHTS:
+            return
         for item in self._poi_highlight_items:
             self._scene.removeItem(item)
         self._poi_highlight_items.clear()
@@ -1047,6 +1202,8 @@ class GraphRenderer(QObject):
 
     def _render_poi_segment_highlights(self, paths, pois) -> None:
         if not self._tc.is_valid() or not pois:
+            return
+        if self._trail_recording_active:
             return
         drawn: set[tuple[tuple[float, float], tuple[float, float]]] = set()
 
@@ -1192,22 +1349,36 @@ class GraphRenderer(QObject):
         self._view.centerOn(mp)
 
     def _sync_live_tail_line(self) -> None:
-        if self._incr_prev is None:
+        if not self._trail_recording_active:
+            self._tail_line_item.setVisible(False)
+            self._lead_dot_item.setVisible(False)
             return
         mp = self._live_marker.pos()
-        dx = mp.x() - self._incr_prev[0]
-        dy = mp.y() - self._incr_prev[1]
-        if dx * dx + dy * dy < 1.0:
-            self._tail_line_item.setVisible(False)
+        if not self._live_marker.isVisible():
+            self._lead_dot_item.setVisible(False)
             return
-        tail = QPainterPath()
-        tail.moveTo(self._incr_prev[0], self._incr_prev[1])
-        tail.lineTo(mp.x(), mp.y())
-        self._tail_line_item.setPath(tail)
-        self._tail_line_item.setVisible(True)
-        c = QColor(PATH_COLORS[self._incr_path_count % len(PATH_COLORS)])
-        c.setAlpha(120)
-        self._tail_line_item.setPen(QPen(c, 1.5, Qt.SolidLine))
+        anchor: tuple[float, float] | None = None
+        if self._trail_pts:
+            anchor = self._trail_pts[-1]
+        elif self._incr_prev is not None:
+            anchor = self._incr_prev
+        pen = _recording_path_pen(self._incr_path_count)
+        if anchor is not None:
+            dx = mp.x() - anchor[0]
+            dy = mp.y() - anchor[1]
+            if dx * dx + dy * dy >= 1.0:
+                tail = QPainterPath()
+                tail.moveTo(anchor[0], anchor[1])
+                tail.lineTo(mp.x(), mp.y())
+                self._tail_line_item.setPath(tail)
+                self._tail_line_item.setPen(pen)
+                self._tail_line_item.setVisible(True)
+            else:
+                self._tail_line_item.setVisible(False)
+        else:
+            self._tail_line_item.setVisible(False)
+        self._lead_dot_item.setPos(mp)
+        self._lead_dot_item.setVisible(False)
 
     def update_live_marker(self, x: float, y: float, instant: bool = False) -> None:
         if not math.isfinite(x) or not math.isfinite(y):
@@ -1225,7 +1396,7 @@ class GraphRenderer(QObject):
         self._sync_live_tail_line()
         if bounds_changed and not self._suppress_bounds_signal:
             self.bounds_expanded.emit()
-        if self._cached_pois:
+        if ENABLE_POI_TRAIL_HIGHLIGHTS and self._cached_pois and not self._trail_recording_active:
             prev = self._poi_highlight_live_pos
             moved = (
                 prev is None
@@ -1251,12 +1422,13 @@ class GraphRenderer(QObject):
             self._active_path = QPainterPath()
             self._active_path.moveTo(*pt)
             self._active_path_item = QGraphicsPathItem(self._active_path)
-            self._active_path_item.setPen(_path_color(self._incr_path_count))
+            self._active_path_item.setPen(_recording_path_pen(self._incr_path_count))
             _init_trail_path_item(self._active_path_item)
             self._scene.addItem(self._active_path_item)
             self._tail_line_item.setPath(QPainterPath())
             self._tail_line_item.setVisible(False)
             self.set_smooth_marker_target(sx, sy, instant=True)
+            self._incr_prev = pt
 
         elif self._incr_prev is not None:
             if not self._trail_pts:
@@ -1269,7 +1441,7 @@ class GraphRenderer(QObject):
                     self._active_path = QPainterPath()
                     self._active_path.moveTo(*self._trail_pts[0])
                     self._active_path_item = QGraphicsPathItem(self._active_path)
-                    self._active_path_item.setPen(_path_color(self._incr_path_count))
+                    self._active_path_item.setPen(_recording_path_pen(self._incr_path_count))
                     _init_trail_path_item(self._active_path_item)
                     self._scene.addItem(self._active_path_item)
                 self._active_path.lineTo(*self._trail_pts[1])
@@ -1281,7 +1453,7 @@ class GraphRenderer(QObject):
                     self._active_path = QPainterPath()
                     self._active_path.moveTo(*self._trail_pts[0])
                     self._active_path_item = QGraphicsPathItem(self._active_path)
-                    self._active_path_item.setPen(_path_color(self._incr_path_count))
+                    self._active_path_item.setPen(_recording_path_pen(self._incr_path_count))
                     _init_trail_path_item(self._active_path_item)
                     self._scene.addItem(self._active_path_item)
                 pts = self._trail_pts
@@ -1302,25 +1474,21 @@ class GraphRenderer(QObject):
                 tail.moveTo(*anchor)
                 tail.lineTo(*pt)
                 self._tail_line_item.setPath(tail)
-                self._tail_line_item.setVisible(True)
-                c = QColor(PATH_COLORS[self._incr_path_count % len(PATH_COLORS)])
-                c.setAlpha(120)
-                tail_pen = QPen(c, 1.5, Qt.SolidLine)
-                self._tail_line_item.setPen(tail_pen)
+                self._tail_line_item.setPen(_recording_path_pen(self._incr_path_count))
+                self._tail_line_item.setVisible(self._trail_recording_active)
 
         else:
             self._trail_pts = [pt]
             self._active_path = QPainterPath()
             self._active_path.moveTo(*pt)
             self._active_path_item = QGraphicsPathItem(self._active_path)
-            self._active_path_item.setPen(_path_color(self._incr_path_count))
+            self._active_path_item.setPen(_recording_path_pen(self._incr_path_count))
             _init_trail_path_item(self._active_path_item)
             self._scene.addItem(self._active_path_item)
             self._tail_line_item.setPath(QPainterPath())
             self._tail_line_item.setVisible(False)
 
-        self._live_dot_path.addEllipse(pt[0] - 2.5, pt[1] - 2.5, 5, 5)
-        self._live_dot_item.setPath(self._live_dot_path)
+        self._append_recording_dot(pt[0], pt[1])
         self._incr_prev = pt
 
     def _follow_tick(self) -> None:
@@ -1359,6 +1527,19 @@ class GraphRenderer(QObject):
             padded = QRectF(cx - w / 2, cy - h / 2, w, h)
             self._view.fitInView(padded, Qt.KeepAspectRatio)
         self._view.centerOn(mp)
+
+    def set_trail_recording_active(self, active: bool) -> None:
+        self._trail_recording_active = active
+        if not active:
+            self._tail_line_item.setVisible(False)
+            self._lead_dot_item.setVisible(False)
+            for item in self._poi_highlight_items:
+                self._scene.removeItem(item)
+            self._poi_highlight_items.clear()
+        else:
+            for item in self._poi_highlight_items:
+                self._scene.removeItem(item)
+            self._poi_highlight_items.clear()
 
     def set_live_marker_visible(self, visible: bool) -> None:
         self._live_marker.setVisible(visible)

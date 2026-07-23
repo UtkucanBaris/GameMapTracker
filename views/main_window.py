@@ -483,7 +483,7 @@ class MainWindow(QMainWindow):
         if self._recording:
             self._graph_renderer._suppress_bounds_signal = True
             try:
-                self._render_trail()
+                self._graph_renderer.rebuild_recording_trail(self._trail.paths)
                 self._graph_renderer.note_paths_for_poi_highlights(self._trail.paths)
                 if self._last_live_x is not None and self._last_live_y is not None:
                     self._graph_renderer.update_live_marker(
@@ -560,6 +560,7 @@ class MainWindow(QMainWindow):
             return
 
         self._trail.teleport_threshold = self._teleport_input.value()
+        self._trail.reset_live_sampling()
         self._trail.start_new_path()
         self._recording_start = time.monotonic()
         self._total_dist = 0.0
@@ -570,6 +571,7 @@ class MainWindow(QMainWindow):
         self._polling.start(x_addr, y_addr, interval)
 
         self._recording = True
+        self._graph_renderer.set_trail_recording_active(True)
         self._graph_renderer.render(self._trail.paths, self._trail.pois, preserve_transform=True)
         self._graph_renderer.follow_zoom_enabled = self._zoom_follow_check.isChecked()
         if self._zoom_follow_check.isChecked():
@@ -583,6 +585,7 @@ class MainWindow(QMainWindow):
 
     def _stop_recording(self) -> None:
         self._recording = False
+        self._graph_renderer.set_trail_recording_active(False)
         self._graph_renderer.auto_follow_active = False
         self._graph_renderer.hide_stats()
         self._trail.prune_empty_current_path()
