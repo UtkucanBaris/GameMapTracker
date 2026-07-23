@@ -48,7 +48,6 @@ POI_RING_CLOSE_COVERAGE = 0.78
 POI_OPEN_ARC_MAX = 200.0
 POI_OPEN_DIST_SLACK = 1.025
 POI_MARKER_RADIUS_PX = 14.0
-ENABLE_POI_TRAIL_HIGHLIGHTS = False
 LIVE_BOOTSTRAP_PAD = 400.0
 PADDING = 20.0
 PATH_COLORS = [
@@ -537,6 +536,7 @@ class GraphRenderer(QObject):
         self._follow_paused_by_user: bool = False
         self._view_drag_active: bool = False
         self._poi_highlight_live_pos: tuple[float, float] | None = None
+        self._poi_trail_highlights_enabled: bool = False
         self._prev_follow_game_pos: tuple[float, float] | None = None
         self._incr_prev: tuple[float, float] | None = None
         self._trail_recording_active: bool = False
@@ -549,21 +549,6 @@ class GraphRenderer(QObject):
         self._tail_line_item.setZValue(4)
         self._tail_line_item.setVisible(False)
         self._scene.addItem(self._tail_line_item)
-
-        self._lead_dot_item = QGraphicsEllipseItem(-3.5, -3.5, 7, 7)
-        self._lead_dot_item.setPen(DOT_PEN)
-        self._lead_dot_item.setBrush(DOT_BRUSH)
-        self._lead_dot_item.setZValue(5)
-        self._lead_dot_item.setVisible(False)
-        self._lead_dot_item.setFlag(QGraphicsItem.ItemIgnoresTransformations)
-        self._scene.addItem(self._lead_dot_item)
-
-        self._live_dot_path = QPainterPath()
-        self._live_dot_item = QGraphicsPathItem(self._live_dot_path)
-        self._live_dot_item.setPen(Qt.NoPen)
-        self._live_dot_item.setBrush(DOT_BRUSH)
-        self._live_dot_item.setZValue(8)
-        self._scene.addItem(self._live_dot_item)
         self._recording_dot_items: list[QGraphicsEllipseItem] = []
 
         self._follow_timer.start()
@@ -602,6 +587,20 @@ class GraphRenderer(QObject):
     def flip_x_map(self, val: bool) -> None:
         self._flip_x_map = val
         self._tc.flip_x_map = val
+
+    @property
+    def poi_trail_highlights_enabled(self) -> bool:
+        return self._poi_trail_highlights_enabled
+
+    @poi_trail_highlights_enabled.setter
+    def poi_trail_highlights_enabled(self, val: bool) -> None:
+        self._poi_trail_highlights_enabled = val
+        if not val:
+            for item in self._poi_highlight_items:
+                self._scene.removeItem(item)
+            self._poi_highlight_items.clear()
+        elif not self._trail_recording_active and self._cached_paths and self._cached_pois:
+            self._refresh_poi_highlights()
 
     @property
     def fade_trail_enabled(self) -> bool:
@@ -780,7 +779,7 @@ class GraphRenderer(QObject):
 
         self._cached_paths = paths
         self._cached_pois = list(pois)
-        if ENABLE_POI_TRAIL_HIGHLIGHTS:
+        if self._poi_trail_highlights_enabled:
             self._render_poi_segment_highlights(paths, pois)
 
         if self._trail_recording_active:
@@ -820,8 +819,6 @@ class GraphRenderer(QObject):
         for item in self._recording_dot_items:
             self._scene.removeItem(item)
         self._recording_dot_items.clear()
-        self._live_dot_path = QPainterPath()
-        self._live_dot_item.setPath(self._live_dot_path)
 
     def _append_recording_dot(self, sx: float, sy: float) -> None:
         dot = QGraphicsEllipseItem(-3.5, -3.5, 7, 7)
@@ -1185,11 +1182,11 @@ class GraphRenderer(QObject):
 
     def note_paths_for_poi_highlights(self, paths) -> None:
         self._cached_paths = paths
-        if ENABLE_POI_TRAIL_HIGHLIGHTS and self._cached_pois and not self._trail_recording_active:
+        if self._poi_trail_highlights_enabled and self._cached_pois and not self._trail_recording_active:
             self._refresh_poi_highlights()
 
     def _refresh_poi_highlights(self) -> None:
-        if not ENABLE_POI_TRAIL_HIGHLIGHTS:
+        if not self._poi_trail_highlights_enabled:
             return
         for item in self._poi_highlight_items:
             self._scene.removeItem(item)
@@ -1236,17 +1233,8 @@ class GraphRenderer(QObject):
                 if len(path) < 2:
                     continue
                 verts = self._path_vertices(path)
-                extra = None
-                if (
-                    pidx == len(paths) - 1
-                    and self._last_game_pos is not None
-                ):
-                    lx, ly = self._game_xy(path[-1])
-                    gx, gy = self._last_game_pos
-                    if (lx - gx) ** 2 + (ly - gy) ** 2 > 1.0:
-                        extra = (lx, ly, gx, gy)
                 _highlight_poi_polar_nearest(
-                    poi.x, poi.y, verts, g2s, pen, _highlight_segment, extra
+                    poi.x, poi.y, verts, g2s, pen, _highlight_segment, None
                 )
 
     def _bootstrap_transform_from_live(self, gx: float, gy: float) -> None:
@@ -1351,11 +1339,9 @@ class GraphRenderer(QObject):
     def _sync_live_tail_line(self) -> None:
         if not self._trail_recording_active:
             self._tail_line_item.setVisible(False)
-            self._lead_dot_item.setVisible(False)
             return
         mp = self._live_marker.pos()
         if not self._live_marker.isVisible():
-            self._lead_dot_item.setVisible(False)
             return
         anchor: tuple[float, float] | None = None
         if self._trail_pts:
@@ -1377,8 +1363,6 @@ class GraphRenderer(QObject):
                 self._tail_line_item.setVisible(False)
         else:
             self._tail_line_item.setVisible(False)
-        self._lead_dot_item.setPos(mp)
-        self._lead_dot_item.setVisible(False)
 
     def update_live_marker(self, x: float, y: float, instant: bool = False) -> None:
         if not math.isfinite(x) or not math.isfinite(y):
@@ -1396,7 +1380,7 @@ class GraphRenderer(QObject):
         self._sync_live_tail_line()
         if bounds_changed and not self._suppress_bounds_signal:
             self.bounds_expanded.emit()
-        if ENABLE_POI_TRAIL_HIGHLIGHTS and self._cached_pois and not self._trail_recording_active:
+        if self._poi_trail_highlights_enabled and self._cached_pois and not self._trail_recording_active:
             prev = self._poi_highlight_live_pos
             moved = (
                 prev is None
@@ -1532,7 +1516,6 @@ class GraphRenderer(QObject):
         self._trail_recording_active = active
         if not active:
             self._tail_line_item.setVisible(False)
-            self._lead_dot_item.setVisible(False)
             for item in self._poi_highlight_items:
                 self._scene.removeItem(item)
             self._poi_highlight_items.clear()

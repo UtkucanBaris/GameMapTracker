@@ -38,6 +38,7 @@ class TrailModel:
     paths: list[list[TrailPoint]] = field(default_factory=list)
     pois: list[POI] = field(default_factory=list)
     teleport_threshold: float = TELEPORT_THRESHOLD
+    min_distance: float = MIN_DISTANCE
     _poll_prev: tuple[float, float] | None = field(default=None, repr=False)
     _walk_since_add: float = field(default=0.0, repr=False)
 
@@ -64,8 +65,9 @@ class TrailModel:
         if current:
             last = current[-1]
             d2 = _squared_dist(last, (x, y))
-            direct_ok = d2 >= MIN_DISTANCE * MIN_DISTANCE
-            accum_ok = self._walk_since_add >= MIN_DISTANCE
+            min_d = self.min_distance
+            direct_ok = d2 >= min_d * min_d
+            accum_ok = self._walk_since_add >= min_d
             if not direct_ok and not accum_ok:
                 return False
             if d2 > self.teleport_threshold * self.teleport_threshold:

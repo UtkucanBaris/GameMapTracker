@@ -304,6 +304,15 @@ class MainWindow(QMainWindow):
         self._interval_input.setSingleStep(50)
         addr_layout.addWidget(self._interval_input)
 
+        addr_layout.addWidget(QLabel("Min point distance:"))
+        self._min_distance_spin = QDoubleSpinBox()
+        self._min_distance_spin.setRange(5.0, 200.0)
+        self._min_distance_spin.setValue(MIN_DISTANCE)
+        self._min_distance_spin.setSingleStep(2.0)
+        self._min_distance_spin.setSuffix(" u")
+        self._min_distance_spin.valueChanged.connect(self._on_min_distance_changed)
+        addr_layout.addWidget(self._min_distance_spin)
+
         addr_layout.addWidget(QLabel("Idle Auto-Pause:"))
         self._idle_threshold_spin = QDoubleSpinBox()
         self._idle_threshold_spin.setRange(0, 30)
@@ -368,6 +377,12 @@ class MainWindow(QMainWindow):
         self._fade_trail_check = QCheckBox("Fade Trail")
         self._fade_trail_check.setEnabled(False)
         tool_layout.addWidget(self._fade_trail_check)
+        self._poi_highlight_check = QCheckBox("POI Path Highlight")
+        self._poi_highlight_check.setEnabled(False)
+        self._poi_highlight_check.setToolTip(
+            "Color trail segments nearest each POI (off while recording)."
+        )
+        tool_layout.addWidget(self._poi_highlight_check)
         tool_layout.addWidget(self._zoom_fit_btn)
         ctrl_layout.addLayout(tool_layout)
 
@@ -447,6 +462,7 @@ class MainWindow(QMainWindow):
         self._smooth_btn.clicked.connect(self._on_smooth)
         self._heat_btn.clicked.connect(self._on_toggle_heat)
         self._fade_trail_check.toggled.connect(self._on_toggle_fade)
+        self._poi_highlight_check.toggled.connect(self._on_toggle_poi_highlight)
         self._zoom_fit_btn.clicked.connect(self._on_zoom_fit)
         self._profile_combo.currentTextChanged.connect(self._on_profile_changed)
         self._profile_save_btn.clicked.connect(self._on_profile_save)
@@ -560,6 +576,7 @@ class MainWindow(QMainWindow):
             return
 
         self._trail.teleport_threshold = self._teleport_input.value()
+        self._trail.min_distance = self._min_distance_spin.value()
         self._trail.reset_live_sampling()
         self._trail.start_new_path()
         self._recording_start = time.monotonic()
@@ -893,6 +910,15 @@ class MainWindow(QMainWindow):
         if self._trail.has_data:
             self._graph_renderer.render(self._trail.paths, self._trail.pois, preserve_transform=True)
         self._set_status("Fade " + ("ON" if checked else "OFF"), "#4ec9b0")
+
+    def _on_toggle_poi_highlight(self, checked: bool) -> None:
+        self._graph_renderer.poi_trail_highlights_enabled = checked
+        if checked and self._trail.has_data and not self._recording:
+            self._graph_renderer.note_paths_for_poi_highlights(self._trail.paths)
+        self._set_status("POI path highlight " + ("ON" if checked else "OFF"), "#4ec9b0")
+
+    def _on_min_distance_changed(self, val: float) -> None:
+        self._trail.min_distance = val
 
     def _on_zoom_fit(self) -> None:
         self._graph_renderer.zoom_to_fit()
@@ -1284,6 +1310,8 @@ class MainWindow(QMainWindow):
         self._smooth_btn.setEnabled(has_data and not is_recording)
         self._heat_btn.setEnabled(has_data)
         self._fade_trail_check.setEnabled(has_data)
+        self._poi_highlight_check.setEnabled(has_data and bool(self._trail.pois))
+        self._min_distance_spin.setEnabled(not is_recording)
         self._zoom_fit_btn.setEnabled(has_data or self._graph_renderer.has_map)
         self._load_map_btn.setEnabled(not is_recording and not self._calibrating)
         self._clear_map_btn.setEnabled(
