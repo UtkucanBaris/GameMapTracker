@@ -3,6 +3,11 @@
 Windows üzerinde Exanima koordinatlarını okuyup patika ve POI olarak kaydeden
 PySide6 masaüstü uygulaması.
 
+> Bu proje, Exanima hareket takibi fikri için
+> [Sokkero/exanimapHelper](https://github.com/Sokkero/exanimapHelper)
+> projesinden esinlenilmiştir. Bağımsız bir Python uygulamasıdır; orijinal depo
+> ile doğrudan bağlantılı değildir.
+
 ## Gereksinimler
 
 - Windows 10/11
