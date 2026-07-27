@@ -28,3 +28,27 @@ Run after map/camera/render changes. Pan and zoom to a non-default view first, t
 |------|--------|----------|
 | 11 | Highlight **off** while recording | No colored overlay on path |
 | 12 | Highlight **on** after stop, loop POI in center | Only nearest ring segments colored, not whole map |
+
+## Manual trail paint
+
+| Step | Action | Expected |
+|------|--------|----------|
+| 13 | Select **POI** in list, enable **Paint Trail**, drag on loop | Segments under brush use POI category color |
+| 14 | **Erase** on, drag painted area | Color removed |
+| 15 | Restart app | Painted segments restored from `trail.json` |
+
+## Lifecycle and long-session checks
+
+| Step | Mode | Action | Expected |
+|------|------|--------|----------|
+| 16 | SEMI-AUTO | Start, then Stop; wait 10 seconds | No new memory reads, live marker/labels do not reappear |
+| 17 | SEMI-AUTO | Set Idle threshold, stop moving, then move again | Status changes to idle, then resumes and records the movement |
+| 18 | MANUAL-WINDOWS | Close the window while recording | Polling, follow timer, hotkeys and process handle are released without an error |
+| 19 | SEMI-AUTO | Record/import a 10k+ point trail with Zoom Follow | View remains usable; incremental trail and smooth marker remain visible |
+| 20 | MANUAL-WINDOWS | Toggle Auto Follow/Zoom Follow and manually pan | Follow pauses on manual pan and resumes after meaningful movement |
+
+## Verification modes
+
+- **AUTO:** `uv run pytest` veya `QT_QPA_PLATFORM=offscreen uv run pytest -m qt`.
+- **SEMI-AUTO:** Fake data/offscreen testinden sonra kısa kullanıcı doğrulaması.
+- **MANUAL-WINDOWS:** Exanima ve gerçek F8/F10/native window lifecycle ile doğrulama.

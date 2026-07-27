@@ -1,6 +1,9 @@
 from __future__ import annotations
 import math
 import time
+from collections import deque
+from collections.abc import Sequence
+from typing import TypeAlias
 
 from PySide6.QtCore import Qt, QRectF, QPointF, QTimer, QObject, Signal
 from PySide6.QtGui import (
@@ -10,11 +13,8 @@ from PySide6.QtGui import (
     QPainterPath,
     QPainter,
     QPixmap,
-    QImage,
     QFont,
-    QFontMetrics,
     QTransform,
-    qAlpha,
     qRgba,
 )
 from PySide6.QtWidgets import (
@@ -29,10 +29,20 @@ from PySide6.QtWidgets import (
 )
 
 from settings_service import MapCalibration
-from trail_model import POI, MIN_DISTANCE
+from trail_model import POI, MIN_DISTANCE, TrailModel
+from rendering_geometry import (
+    dist_sq_point_to_segment,
+    game_xy,
+)
+
+
+PointLike: TypeAlias = tuple[float, float]
+TrailPaths: TypeAlias = Sequence[Sequence[PointLike]]
 
 
 FOLLOW_ZOOM_INTERVAL = 0.05
+MAX_LIVE_TRAIL_POINTS = 2048
+MAX_RECORDING_DOTS = 4096
 FOLLOW_ZOOM_COMFORT = 0.50
 FOLLOW_ZOOM_MIN_EXTENT = 280.0
 FOLLOW_ZOOM_MAX_EXTENT = 1100.0
@@ -85,7 +95,7 @@ POI_CATEGORY_COLORS: dict[str, QColor] = {
 def _poi_category_color(category: str) -> QColor:
     return POI_CATEGORY_COLORS.get(category, QColor(0xFF, 0xCC, 0x00))
 
-def _heat_color(val: int) -> QRgb:
+def _heat_color(val: int) -> int:
     t = val / 255.0
     if t < 0.25:
         r2 = 0
@@ -124,18 +134,7 @@ def _init_trail_path_item(item: QGraphicsPathItem) -> None:
 def _dist_sq_point_to_segment(
     px: float, py: float, x1: float, y1: float, x2: float, y2: float
 ) -> float:
-    dx = x2 - x1
-    dy = y2 - y1
-    if dx == 0 and dy == 0:
-        ddx = px - x1
-        ddy = py - y1
-        return ddx * ddx + ddy * ddy
-    t = max(0.0, min(1.0, ((px - x1) * dx + (py - y1) * dy) / (dx * dx + dy * dy)))
-    cx = x1 + t * dx
-    cy = y1 + t * dy
-    ddx = px - cx
-    ddy = py - cy
-    return ddx * ddx + ddy * ddy
+    return dist_sq_point_to_segment(px, py, x1, y1, x2, y2)
 
 
 def _path_gap(verts: list[tuple[float, float]]) -> float:
@@ -465,6 +464,7 @@ class GraphRenderer(QObject):
     poi_edit_requested = Signal(int)
     poi_delete_requested = Signal(int)
     bounds_expanded = Signal()
+    trail_paint_changed = Signal()
 
     def __init__(self, view: QGraphicsView):
         super().__init__()
@@ -537,6 +537,13 @@ class GraphRenderer(QObject):
         self._view_drag_active: bool = False
         self._poi_highlight_live_pos: tuple[float, float] | None = None
         self._poi_trail_highlights_enabled: bool = False
+        self._trail_paint_mode: bool = False
+        self._trail_paint_erase: bool = False
+        self._brush_radius_px: float = 16.0
+        self._paint_category: str | None = None
+        self._trail_model: TrailModel | None = None
+        self._paint_stroke_active: bool = False
+        self._painted_segment_items: list[QGraphicsPathItem] = []
         self._prev_follow_game_pos: tuple[float, float] | None = None
         self._incr_prev: tuple[float, float] | None = None
         self._trail_recording_active: bool = False
@@ -549,9 +556,9 @@ class GraphRenderer(QObject):
         self._tail_line_item.setZValue(4)
         self._tail_line_item.setVisible(False)
         self._scene.addItem(self._tail_line_item)
-        self._recording_dot_items: list[QGraphicsEllipseItem] = []
+        self._recording_dot_items: deque[QGraphicsEllipseItem] = deque()
+        self._last_paint_apply_pos: QPointF | None = None
 
-        self._follow_timer.start()
         view.viewport().installEventFilter(self)
 
     @property
@@ -561,6 +568,15 @@ class GraphRenderer(QObject):
     @property
     def has_map(self) -> bool:
         return self._map_pixmap is not None
+
+    def is_transform_ready(self) -> bool:
+        return self._tc.is_valid()
+
+    def map_pixmap_for_save(self) -> QPixmap | None:
+        return self._map_pixmap
+
+    def set_bounds_signal_suppressed(self, suppressed: bool) -> None:
+        self._suppress_bounds_signal = suppressed
 
     @property
     def heat_map_enabled(self) -> bool:
@@ -602,6 +618,47 @@ class GraphRenderer(QObject):
         elif not self._trail_recording_active and self._cached_paths and self._cached_pois:
             self._refresh_poi_highlights()
 
+    def bind_trail_model(self, trail: TrailModel) -> None:
+        self._trail_model = trail
+
+    @property
+    def trail_paint_mode(self) -> bool:
+        return self._trail_paint_mode
+
+    @trail_paint_mode.setter
+    def trail_paint_mode(self, val: bool) -> None:
+        self._trail_paint_mode = val
+        if val:
+            self._view.setDragMode(QGraphicsView.NoDrag)
+        else:
+            self._view.setDragMode(QGraphicsView.ScrollHandDrag)
+            self._paint_stroke_active = False
+            self._last_paint_apply_pos = None
+
+    @property
+    def trail_paint_erase(self) -> bool:
+        return self._trail_paint_erase
+
+    @trail_paint_erase.setter
+    def trail_paint_erase(self, val: bool) -> None:
+        self._trail_paint_erase = val
+
+    @property
+    def brush_radius_px(self) -> float:
+        return self._brush_radius_px
+
+    @brush_radius_px.setter
+    def brush_radius_px(self, val: float) -> None:
+        self._brush_radius_px = max(4.0, min(64.0, float(val)))
+
+    @property
+    def paint_category(self) -> str | None:
+        return self._paint_category
+
+    @paint_category.setter
+    def paint_category(self, val: str | None) -> None:
+        self._paint_category = val
+
     @property
     def fade_trail_enabled(self) -> bool:
         return self._fade_trail_enabled
@@ -619,6 +676,9 @@ class GraphRenderer(QObject):
         self._follow_active = val
         if val:
             self._follow_paused_by_user = False
+            self.start_follow_timer()
+        elif not self._follow_zoom_enabled and not self._trail_recording_active:
+            self.stop_follow_timer()
 
     @property
     def follow_zoom_enabled(self) -> bool:
@@ -629,6 +689,22 @@ class GraphRenderer(QObject):
         self._follow_zoom_enabled = val
         if val:
             self._follow_paused_by_user = False
+            self.start_follow_timer()
+        elif not self._follow_active and not self._trail_recording_active:
+            self.stop_follow_timer()
+
+    def start_follow_timer(self) -> None:
+        if not self._follow_timer.isActive():
+            self._follow_last_mono = time.monotonic()
+            self._follow_timer.start()
+
+    def stop_follow_timer(self) -> None:
+        self._follow_timer.stop()
+
+    def shutdown(self) -> None:
+        self.stop_follow_timer()
+        self._tail_line_item.setVisible(False)
+        self._live_marker.setVisible(False)
 
     def zoom_to_fit(self) -> None:
         rect = self._scene.itemsBoundingRect()
@@ -651,11 +727,42 @@ class GraphRenderer(QObject):
         sx, sy = self._tc.game_to_screen(x, y)
         self._view.centerOn(sx, sy)
 
+    @staticmethod
+    def _event_viewport_pos(event) -> QPointF:
+        if hasattr(event, "position"):
+            p = event.position()
+            return QPointF(p.x(), p.y())
+        return QPointF(event.pos())
+
     def eventFilter(self, obj, event) -> bool:
         try:
             vp = self._view.viewport()
         except RuntimeError:
             return False
+
+        if (
+            self._trail_paint_mode
+            and not self._trail_recording_active
+            and obj is vp
+            and self._paint_category is not None
+            and self._trail_model is not None
+        ):
+            et = event.type()
+            if et == event.Type.MouseButtonPress and event.button() == Qt.LeftButton:
+                self._paint_stroke_active = True
+                self._apply_trail_brush_viewport(self._event_viewport_pos(event))
+                return True
+            if et == event.Type.MouseMove and self._paint_stroke_active:
+                if event.buttons() & Qt.LeftButton:
+                    self._apply_trail_brush_viewport(self._event_viewport_pos(event))
+                    return True
+            if et == event.Type.MouseButtonRelease and event.button() == Qt.LeftButton:
+                if self._paint_stroke_active:
+                    self._paint_stroke_active = False
+                    self._last_paint_apply_pos = None
+                    self.trail_paint_changed.emit()
+                    return True
+
         if obj is vp and event.type() == event.Type.Wheel:
             modifiers = event.modifiers()
             if modifiers & Qt.ControlModifier:
@@ -745,6 +852,7 @@ class GraphRenderer(QObject):
         for item in self._poi_highlight_items:
             self._scene.removeItem(item)
         self._poi_highlight_items.clear()
+        self._clear_painted_overlay()
         for item in self._poi_text_items:
             self._scene.removeItem(item)
         self._poi_text_items.clear()
@@ -763,7 +871,12 @@ class GraphRenderer(QObject):
         self._trail_pts.clear()
         self.clear_selection()
 
-    def render(self, paths: list[list[tuple[float, float]]], pois: list, preserve_transform: bool = False) -> None:
+    def render(
+        self,
+        paths: TrailPaths,
+        pois: Sequence[POI],
+        preserve_transform: bool = False,
+    ) -> None:
         if not preserve_transform:
             self._view.resetTransform()
             self._auto_fit_max_y = None
@@ -782,6 +895,8 @@ class GraphRenderer(QObject):
         if self._poi_trail_highlights_enabled:
             self._render_poi_segment_highlights(paths, pois)
 
+        self._refresh_painted_overlay(paths)
+
         if self._trail_recording_active:
             self.rebuild_recording_trail(paths)
         else:
@@ -794,9 +909,7 @@ class GraphRenderer(QObject):
 
     @staticmethod
     def _game_xy(pt) -> tuple[float, float]:
-        if hasattr(pt, "x"):
-            return pt.x, pt.y
-        return pt[0], pt[1]
+        return game_xy(pt)
 
     def _sync_incremental_from_paths(self, paths) -> None:
         if not self._tc.is_valid():
@@ -829,6 +942,8 @@ class GraphRenderer(QObject):
         dot.setZValue(8)
         self._scene.addItem(dot)
         self._recording_dot_items.append(dot)
+        while len(self._recording_dot_items) > MAX_RECORDING_DOTS:
+            self._scene.removeItem(self._recording_dot_items.popleft())
 
     def _draw_static_path(self, pidx: int, path) -> None:
         if len(path) < 2:
@@ -905,7 +1020,7 @@ class GraphRenderer(QObject):
         _init_trail_path_item(self._active_path_item)
         self._scene.addItem(self._active_path_item)
 
-    def rebuild_recording_trail(self, paths) -> None:
+    def rebuild_recording_trail(self, paths: TrailPaths) -> None:
         if not self._tc.is_valid():
             return
         for item in self._path_items:
@@ -938,7 +1053,7 @@ class GraphRenderer(QObject):
         screen_pts = [
             self._tc.game_to_screen(*self._game_xy(p)) for p in current
         ]
-        self._trail_pts = screen_pts[:]
+        self._trail_pts = screen_pts[-MAX_LIVE_TRAIL_POINTS:]
         self._incr_prev = screen_pts[-1] if screen_pts else None
         self._rebuild_active_path_from_screen_pts(screen_pts, last_idx)
 
@@ -1180,7 +1295,7 @@ class GraphRenderer(QObject):
         self._scene.addItem(item)
         self._poi_marker_items.append(item)
 
-    def note_paths_for_poi_highlights(self, paths) -> None:
+    def note_paths_for_poi_highlights(self, paths: TrailPaths) -> None:
         self._cached_paths = paths
         if self._poi_trail_highlights_enabled and self._cached_pois and not self._trail_recording_active:
             self._refresh_poi_highlights()
@@ -1196,6 +1311,82 @@ class GraphRenderer(QObject):
 
     def _path_vertices(self, path) -> list[tuple[float, float]]:
         return [self._game_xy(p) for p in path]
+
+    def _clear_painted_overlay(self) -> None:
+        for item in self._painted_segment_items:
+            self._scene.removeItem(item)
+        self._painted_segment_items.clear()
+
+    def _refresh_painted_overlay(self, paths) -> None:
+        self._clear_painted_overlay()
+        if not self._trail_model or not self._tc.is_valid():
+            return
+        painted = self._trail_model.painted_segments
+        for (pidx, seg), cat in painted.items():
+            if pidx < 0 or pidx >= len(paths):
+                continue
+            path = paths[pidx]
+            if seg < 0 or seg >= len(path) - 1:
+                continue
+            gx1, gy1 = self._game_xy(path[seg])
+            gx2, gy2 = self._game_xy(path[seg + 1])
+            sx1, sy1 = self._tc.game_to_screen(gx1, gy1)
+            sx2, sy2 = self._tc.game_to_screen(gx2, gy2)
+            seg_path = QPainterPath()
+            seg_path.moveTo(sx1, sy1)
+            seg_path.lineTo(sx2, sy2)
+            color = _poi_category_color(cat)
+            pen = QPen(color, 6.0, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
+            pen.setCosmetic(True)
+            item = QGraphicsPathItem(seg_path)
+            item.setPen(pen)
+            item.setZValue(14)
+            self._scene.addItem(item)
+            self._painted_segment_items.append(item)
+
+    def _apply_trail_brush_viewport(self, vp_pos) -> None:
+        if not self._tc.is_valid() or self._trail_model is None or self._paint_category is None:
+            return
+        paths = self._trail_model.paths
+        painted = self._trail_model.painted_segments
+        r = self._brush_radius_px
+        r2 = r * r
+        vx = float(vp_pos.x())
+        vy = float(vp_pos.y())
+        if self._last_paint_apply_pos is not None:
+            dx = vx - self._last_paint_apply_pos.x()
+            dy = vy - self._last_paint_apply_pos.y()
+            if dx * dx + dy * dy < 4.0:
+                return
+        self._last_paint_apply_pos = QPointF(vx, vy)
+        changed = False
+        for pidx, path in enumerate(paths):
+            if len(path) < 2:
+                continue
+            for seg in range(len(path) - 1):
+                gx1, gy1 = self._game_xy(path[seg])
+                gx2, gy2 = self._game_xy(path[seg + 1])
+                sx1, sy1 = self._tc.game_to_screen(gx1, gy1)
+                sx2, sy2 = self._tc.game_to_screen(gx2, gy2)
+                p1 = self._view.mapFromScene(QPointF(sx1, sy1))
+                p2 = self._view.mapFromScene(QPointF(sx2, sy2))
+                d2 = _dist_sq_point_to_segment(
+                    vx, vy, p1.x(), p1.y(), p2.x(), p2.y()
+                )
+                if d2 > r2:
+                    continue
+                key = (pidx, seg)
+                if self._trail_paint_erase:
+                    if key in painted:
+                        del painted[key]
+                        changed = True
+                else:
+                    cat = self._paint_category
+                    if painted.get(key) != cat:
+                        painted[key] = cat
+                        changed = True
+        if changed:
+            self._refresh_painted_overlay(paths)
 
     def _render_poi_segment_highlights(self, paths, pois) -> None:
         if not self._tc.is_valid() or not pois:
@@ -1473,6 +1664,8 @@ class GraphRenderer(QObject):
             self._tail_line_item.setVisible(False)
 
         self._append_recording_dot(pt[0], pt[1])
+        if len(self._trail_pts) > MAX_LIVE_TRAIL_POINTS:
+            del self._trail_pts[:-MAX_LIVE_TRAIL_POINTS]
         self._incr_prev = pt
 
     def _follow_tick(self) -> None:
@@ -1514,6 +1707,10 @@ class GraphRenderer(QObject):
 
     def set_trail_recording_active(self, active: bool) -> None:
         self._trail_recording_active = active
+        if active:
+            self.start_follow_timer()
+        elif not self._follow_active and not self._follow_zoom_enabled:
+            self.stop_follow_timer()
         if not active:
             self._tail_line_item.setVisible(False)
             for item in self._poi_highlight_items:
@@ -1558,14 +1755,13 @@ class GraphRenderer(QObject):
             self._stats_label.deleteLater()
             self._stats_label = None
 
-    def select_point(self, path_idx: int, point_idx: int,
-                     paths: list[list[tuple[float, float]]]) -> None:
+    def select_point(self, path_idx: int, point_idx: int, paths: TrailPaths) -> None:
         self.clear_selection()
         if 0 <= path_idx < len(paths) and 0 <= point_idx < len(paths[path_idx]):
             gx, gy = self._game_xy(paths[path_idx][point_idx])
             self._place_selection_item(gx, gy)
 
-    def select_poi(self, poi_idx: int, pois: list) -> None:
+    def select_poi(self, poi_idx: int, pois: Sequence[POI]) -> None:
         self.clear_selection()
         if 0 <= poi_idx < len(pois):
             p = pois[poi_idx]

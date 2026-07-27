@@ -28,16 +28,17 @@ from PySide6.QtWidgets import (
     QGraphicsView,
     QSizePolicy,
     QMenu,
+    QSlider,
 )
 from PySide6.QtCore import QEvent
 
 from memory_reader import MemoryReader, AttachStatus
-from trail_model import TrailModel, TrailPoint, POI, MIN_DISTANCE
+from trail_model import TrailModel, TrailPoint, MIN_DISTANCE
 from polling_service import PollingService
 from graph_renderer import GraphRenderer
 from export_service import export_text, import_text, export_png
 from hotkey_service import Win32HotkeyService, VK_F8, VK_F10
-from settings_service import load as load_settings, save as save_settings, AppSettings, MapCalibration, SETTINGS_DIR, _apply_profile, _save_current_as_profile, save_trail, load_trail
+from settings_service import load as load_settings, save as save_settings, SETTINGS_DIR, _apply_profile, _save_current_as_profile, save_trail, load_trail
 from views.confirm_dialog import ConfirmDialog
 
 
@@ -170,7 +171,8 @@ class MainWindow(QMainWindow):
             from trail_model import TrailPoint, POI
             paths = [[TrailPoint(*pt) for pt in path] for path in trail_data.get("paths", [])]
             pois = [POI(**p) for p in trail_data.get("pois", [])]
-            self._trail.load(paths, pois)
+            painted = TrailModel.painted_from_json(trail_data.get("painted", []))
+            self._trail.load(paths, pois, painted)
         self._polling = PollingService(self._reader)
         self._hotkey_service: Win32HotkeyService | None = None
         self._graph_renderer: GraphRenderer | None = None
@@ -181,6 +183,8 @@ class MainWindow(QMainWindow):
         self._last_recorded_pos: tuple[float, float] | None = None
         self._last_live_x: float | None = None
         self._last_live_y: float | None = None
+        self._last_stats_update: float = 0.0
+        self._last_list_scroll: float = 0.0
 
         self._bounds_sync_timer = QTimer(self)
         self._bounds_sync_timer.setSingleShot(True)
@@ -386,6 +390,28 @@ class MainWindow(QMainWindow):
         tool_layout.addWidget(self._zoom_fit_btn)
         ctrl_layout.addLayout(tool_layout)
 
+        paint_layout = QHBoxLayout()
+        self._paint_trail_check = QCheckBox("Paint Trail")
+        self._paint_trail_check.setEnabled(False)
+        self._paint_trail_check.setToolTip(
+            "Select a POI in the list, then drag on the map to color trail segments."
+        )
+        paint_layout.addWidget(self._paint_trail_check)
+        self._paint_erase_check = QCheckBox("Erase")
+        self._paint_erase_check.setEnabled(False)
+        paint_layout.addWidget(self._paint_erase_check)
+        paint_layout.addWidget(QLabel("Brush:"))
+        self._brush_slider = QSlider(Qt.Horizontal)
+        self._brush_slider.setRange(4, 48)
+        self._brush_slider.setValue(16)
+        self._brush_slider.setEnabled(False)
+        self._brush_slider.setFixedWidth(120)
+        paint_layout.addWidget(self._brush_slider)
+        self._brush_size_label = QLabel("16 px")
+        paint_layout.addWidget(self._brush_size_label)
+        paint_layout.addStretch()
+        ctrl_layout.addLayout(paint_layout)
+
         left_layout.addWidget(ctrl_group)
 
         profile_group = QGroupBox("Profiles")
@@ -427,6 +453,7 @@ class MainWindow(QMainWindow):
         self._graph_view = QGraphicsView()
         self._graph_view.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self._graph_renderer = GraphRenderer(self._graph_view)
+        self._graph_renderer.bind_trail_model(self._trail)
         right_layout.addWidget(self._graph_view, stretch=3)
 
         self._data_list = QListWidget()
@@ -463,6 +490,9 @@ class MainWindow(QMainWindow):
         self._heat_btn.clicked.connect(self._on_toggle_heat)
         self._fade_trail_check.toggled.connect(self._on_toggle_fade)
         self._poi_highlight_check.toggled.connect(self._on_toggle_poi_highlight)
+        self._paint_trail_check.toggled.connect(self._on_toggle_paint_trail)
+        self._paint_erase_check.toggled.connect(self._on_toggle_paint_erase)
+        self._brush_slider.valueChanged.connect(self._on_brush_size_changed)
         self._zoom_fit_btn.clicked.connect(self._on_zoom_fit)
         self._profile_combo.currentTextChanged.connect(self._on_profile_changed)
         self._profile_save_btn.clicked.connect(self._on_profile_save)
@@ -483,6 +513,29 @@ class MainWindow(QMainWindow):
         self._graph_renderer.poi_moved.connect(self._on_poi_moved)
         self._graph_renderer.poi_edit_requested.connect(self._edit_poi_description)
         self._graph_renderer.poi_delete_requested.connect(self._delete_poi_by_index)
+        self._graph_renderer.trail_paint_changed.connect(self._persist_trail)
+
+    def _persist_trail(self) -> None:
+        save_trail(
+            self._trail.paths,
+            self._trail.pois,
+            self._trail.painted_segments,
+        )
+
+    def _sync_paint_category_from_selection(self) -> None:
+        if not self._paint_trail_check.isChecked():
+            return
+        item = self._data_list.currentItem()
+        if item is None:
+            self._graph_renderer.paint_category = None
+            return
+        kind = item.data(KIND_ROLE)
+        if kind == ROW_KIND_POI:
+            idx = item.data(A_ROLE)
+            if 0 <= idx < len(self._trail.pois):
+                self._graph_renderer.paint_category = self._trail.pois[idx].category
+                return
+        self._graph_renderer.paint_category = None
 
     def _schedule_bounds_sync_render(self) -> None:
         if self._recording:
@@ -497,7 +550,7 @@ class MainWindow(QMainWindow):
 
     def _on_bounds_sync_render(self) -> None:
         if self._recording:
-            self._graph_renderer._suppress_bounds_signal = True
+            self._graph_renderer.set_bounds_signal_suppressed(True)
             try:
                 self._graph_renderer.rebuild_recording_trail(self._trail.paths)
                 self._graph_renderer.note_paths_for_poi_highlights(self._trail.paths)
@@ -506,14 +559,14 @@ class MainWindow(QMainWindow):
                         self._last_live_x, self._last_live_y, instant=True
                     )
             finally:
-                self._graph_renderer._suppress_bounds_signal = False
+                self._graph_renderer.set_bounds_signal_suppressed(False)
 
     def _on_poi_moved(self, idx: int, gx: float, gy: float) -> None:
         if not (0 <= idx < len(self._trail.pois)):
             return
         poi = self._trail.pois[idx]
         self._trail.update_poi(idx, gx, gy, poi.desc, poi.category)
-        save_trail(self._trail.paths, self._trail.pois)
+        save_trail(self._trail.paths, self._trail.pois, self._trail.painted_segments)
         self._graph_renderer.render(self._trail.paths, self._trail.pois, preserve_transform=True)
         self._rebuild_data_list()
 
@@ -521,7 +574,7 @@ class MainWindow(QMainWindow):
         if not (0 <= idx < len(self._trail.pois)):
             return
         self._trail.remove_poi(idx)
-        save_trail(self._trail.paths, self._trail.pois)
+        save_trail(self._trail.paths, self._trail.pois, self._trail.painted_segments)
         self._rebuild_data_list()
         self._graph_renderer.render(self._trail.paths, self._trail.pois, preserve_transform=True)
 
@@ -545,7 +598,7 @@ class MainWindow(QMainWindow):
         if not self._reader.has_handle:
             status = self._reader.attach()
             if status == AttachStatus.ProcessNotFound:
-                self._set_status(f"{self._reader._process_name} not found", "red")
+                self._set_status(f"{self._reader.process_name} not found", "red")
                 return
             elif status == AttachStatus.AccessDenied:
                 self._set_status("Access denied - run as admin", "red")
@@ -554,9 +607,8 @@ class MainWindow(QMainWindow):
                 self._set_status("Windows only", "red")
                 return
 
-            proc_name = self._reader._process_name
-            pid = self._reader._pid
-            base = self._reader._module_base
+            proc_name = self._reader.process_name
+            pid = self._reader.pid
 
             lines = [f"{proc_name} (PID {pid})"]
             for info in self._reader.process_candidates:
@@ -576,21 +628,24 @@ class MainWindow(QMainWindow):
             return
 
         self._trail.teleport_threshold = self._teleport_input.value()
-        self._trail.min_distance = self._min_distance_spin.value()
+        self._trail.set_min_distance(self._min_distance_spin.value())
         self._trail.reset_live_sampling()
         self._trail.start_new_path()
         self._recording_start = time.monotonic()
         self._total_dist = 0.0
         self._last_recorded_pos = None
+        self._last_stats_update = 0.0
+        self._last_list_scroll = 0.0
         self._rebuild_data_list()
-
-        interval = self._interval_input.value()
-        self._polling.start(x_addr, y_addr, interval)
 
         self._recording = True
         self._graph_renderer.set_trail_recording_active(True)
-        self._graph_renderer.render(self._trail.paths, self._trail.pois, preserve_transform=True)
         self._graph_renderer.follow_zoom_enabled = self._zoom_follow_check.isChecked()
+        self._on_idle_threshold_changed(self._idle_threshold_spin.value())
+        interval = self._interval_input.value()
+        self._polling.start(x_addr, y_addr, interval)
+
+        self._graph_renderer.render(self._trail.paths, self._trail.pois, preserve_transform=True)
         if self._zoom_follow_check.isChecked():
             self._graph_renderer.recenter_follow_view()
         elif self._trail.has_data:
@@ -601,9 +656,11 @@ class MainWindow(QMainWindow):
         self._set_status("Recording...", "#4ec9b0")
 
     def _stop_recording(self) -> None:
+        self._polling.stop()
         self._recording = False
         self._graph_renderer.set_trail_recording_active(False)
         self._graph_renderer.auto_follow_active = False
+        self._graph_renderer.follow_zoom_enabled = False
         self._graph_renderer.hide_stats()
         self._trail.prune_empty_current_path()
         self._rebuild_data_list()
@@ -629,7 +686,7 @@ class MainWindow(QMainWindow):
         if not candidates:
             return
         items = [
-            f"PID {c.pid}  base=0x{c.module_base:X}  {c.module_size//1024}KB{' (current)' if c.pid == self._reader._pid else ''}"
+            f"PID {c.pid}  base=0x{c.module_base:X}  {c.module_size//1024}KB{' (current)' if c.pid == self._reader.pid else ''}"
             for c in candidates
         ]
         text, ok = QInputDialog.getItem(
@@ -647,7 +704,7 @@ class MainWindow(QMainWindow):
                         break
             if pid is None:
                 return
-            old_pid = self._reader._pid
+            old_pid = self._reader.pid
             was_recording = self._recording
 
             if was_recording:
@@ -657,7 +714,7 @@ class MainWindow(QMainWindow):
             status = self._reader.attach_to(pid)
             if status == AttachStatus.Attached:
                 self._proc_info_label.setText(
-                    f"{self._reader._process_name} (PID {self._reader._pid})"
+                    f"{self._reader.process_name} (PID {self._reader.pid})"
                 )
                 self._proc_select_btn.setEnabled(len(candidates) > 1)
                 if was_recording:
@@ -791,7 +848,7 @@ class MainWindow(QMainWindow):
             self._graph_renderer.set_calibration(self._settings.calibration)
             self._calibrating = False
             self._calib_step = 0
-            self._map_status_label.setText(f"Calibrated: 2 points set")
+            self._map_status_label.setText("Calibrated: 2 points set")
             self._set_status("Calibration complete", "#4ec9b0")
             self._graph_renderer.render(self._trail.paths, self._trail.pois, preserve_transform=True)
 
@@ -818,7 +875,6 @@ class MainWindow(QMainWindow):
         self._graph_renderer.follow_zoom_enabled = checked
 
     def _rebuild_profile_combo(self) -> None:
-        current = self._profile_combo.currentText()
         self._profile_combo.blockSignals(True)
         self._profile_combo.clear()
         names = sorted(self._settings.profiles.keys())
@@ -877,7 +933,7 @@ class MainWindow(QMainWindow):
 
         old_polling = self._polling
         old_polling.stop()
-        old_polling._reader.detach()
+        self._reader.detach()
         self._reader = MemoryReader(self._settings.process_name)
         self._polling = PollingService(self._reader)
         self._polling.value_read.connect(self._on_value_read)
@@ -891,8 +947,9 @@ class MainWindow(QMainWindow):
 
     def _on_smooth(self) -> None:
         epsilon = self._epsilon_input.value()
+        self._trail.clear_painted_segments()
         self._trail.smooth(epsilon)
-        save_trail(self._trail.paths, self._trail.pois)
+        save_trail(self._trail.paths, self._trail.pois, self._trail.painted_segments)
         self._rebuild_data_list()
         self._graph_renderer.render(self._trail.paths, self._trail.pois, preserve_transform=True)
         self._update_ui_state()
@@ -917,8 +974,30 @@ class MainWindow(QMainWindow):
             self._graph_renderer.note_paths_for_poi_highlights(self._trail.paths)
         self._set_status("POI path highlight " + ("ON" if checked else "OFF"), "#4ec9b0")
 
+    def _on_toggle_paint_trail(self, checked: bool) -> None:
+        if checked and self._recording:
+            self._paint_trail_check.blockSignals(True)
+            self._paint_trail_check.setChecked(False)
+            self._paint_trail_check.blockSignals(False)
+            return
+        self._graph_renderer.trail_paint_mode = checked
+        self._paint_erase_check.setEnabled(checked and not self._recording)
+        self._brush_slider.setEnabled(checked and not self._recording)
+        self._sync_paint_category_from_selection()
+        if checked and self._graph_renderer.paint_category is None:
+            self._set_status("Paint: select a POI in the list first", "orange")
+        else:
+            self._set_status("Paint trail " + ("ON — drag on map" if checked else "OFF"), "#4ec9b0")
+
+    def _on_toggle_paint_erase(self, checked: bool) -> None:
+        self._graph_renderer.trail_paint_erase = checked
+
+    def _on_brush_size_changed(self, val: int) -> None:
+        self._brush_size_label.setText(f"{val} px")
+        self._graph_renderer.brush_radius_px = float(val)
+
     def _on_min_distance_changed(self, val: float) -> None:
-        self._trail.min_distance = val
+        self._trail.set_min_distance(val)
 
     def _on_zoom_fit(self) -> None:
         self._graph_renderer.zoom_to_fit()
@@ -951,7 +1030,7 @@ class MainWindow(QMainWindow):
             if result is not None:
                 desc, category = result
                 self._trail.add_poi(self._last_live_x, self._last_live_y, desc, category)
-                save_trail(self._trail.paths, self._trail.pois)
+                save_trail(self._trail.paths, self._trail.pois, self._trail.painted_segments)
                 self._rebuild_data_list()
                 self._graph_renderer.render(
                     self._trail.paths, self._trail.pois, preserve_transform=True
@@ -959,6 +1038,8 @@ class MainWindow(QMainWindow):
                 self._graph_renderer.note_paths_for_poi_highlights(self._trail.paths)
 
     def _on_value_read(self, x: float, y: float) -> None:
+        if not self._recording:
+            return
         self._last_live_x = x
         self._last_live_y = y
 
@@ -984,28 +1065,35 @@ class MainWindow(QMainWindow):
                 pt = self._trail.paths[-1][-1]
                 path_idx = len(self._trail.paths) - 1
                 self._append_point_item(path_idx, len(self._trail.paths[-1]) - 1, pt)
-                self._data_list.scrollToBottom()
+                now = time.monotonic()
+                if now - self._last_list_scroll >= 0.1:
+                    self._data_list.scrollToBottom()
+                    self._last_list_scroll = now
                 start_new = len(self._trail.paths) > prev_path_count
                 snap_marker = start_new
-                if not self._graph_renderer._tc.is_valid():
+                if not self._graph_renderer.is_transform_ready():
                     self._graph_renderer.render(self._trail.paths, self._trail.pois, preserve_transform=True)
                 self._graph_renderer.note_paths_for_poi_highlights(self._trail.paths)
                 self._graph_renderer.add_trail_point(x, y, start_new_path=start_new)
             elapsed = time.monotonic() - self._recording_start
             speed = self._total_dist / max(0.1, elapsed)
             point_count = sum(len(p) for p in self._trail.paths)
-            self._graph_renderer.update_stats(elapsed, point_count, self._total_dist, speed)
+            if added or elapsed - self._last_stats_update >= 0.25:
+                self._graph_renderer.update_stats(
+                    elapsed, point_count, self._total_dist, speed
+                )
+                self._last_stats_update = elapsed
 
         self._graph_renderer.update_live_marker(x, y, instant=snap_marker)
 
     def _on_read_failed(self) -> None:
         if self._recording:
-            err = self._reader._last_error
+            err = self._reader.last_error
             self._set_status(f"Cannot read memory at these addresses (error {err})", "red")
 
     def _on_interval_changed(self, val: int) -> None:
-        if self._recording and self._polling.is_running:
-            self._polling._timer.setInterval(val)
+        if self._recording:
+            self._polling.set_interval(val)
             self._on_idle_threshold_changed(self._idle_threshold_spin.value())
 
     def _on_teleport_changed(self, val: float) -> None:
@@ -1058,7 +1146,7 @@ class MainWindow(QMainWindow):
         try:
             result = import_text(path)
             self._trail.load(result.paths, result.pois)
-            save_trail(self._trail.paths, self._trail.pois)
+            save_trail(self._trail.paths, self._trail.pois, self._trail.painted_segments)
             self._rebuild_data_list()
             self._render_trail(refit_view=True)
             self._graph_renderer.zoom_to_fit()
@@ -1130,6 +1218,7 @@ class MainWindow(QMainWindow):
             if 0 <= a < len(self._trail.pois):
                 poi = self._trail.pois[a]
                 self._graph_renderer.center_on_position(poi.x, poi.y)
+            self._sync_paint_category_from_selection()
         else:
             self._graph_renderer.clear_selection()
 
@@ -1200,7 +1289,7 @@ class MainWindow(QMainWindow):
         layout.addRow(buttons)
         if dlg.exec() == QDialog.Accepted:
             self._trail.update_poi(idx, poi.x, poi.y, desc_input.text(), cat_combo.currentData())
-            save_trail(self._trail.paths, self._trail.pois)
+            save_trail(self._trail.paths, self._trail.pois, self._trail.painted_segments)
             self._rebuild_data_list()
             self._graph_renderer.render(
                 self._trail.paths, self._trail.pois, preserve_transform=True
@@ -1215,7 +1304,7 @@ class MainWindow(QMainWindow):
             dlg = ConfirmDialog("Delete Point", "Delete this point?", self)
             if dlg.exec() == ConfirmDialog.Accepted:
                 self._trail.remove_point(a, b)
-                save_trail(self._trail.paths, self._trail.pois)
+                save_trail(self._trail.paths, self._trail.pois, self._trail.painted_segments)
                 self._rebuild_data_list()
                 self._graph_renderer.render(
                     self._trail.paths, self._trail.pois, preserve_transform=True
@@ -1225,7 +1314,7 @@ class MainWindow(QMainWindow):
             dlg = ConfirmDialog("Delete POI", "Delete this POI?", self)
             if dlg.exec() == ConfirmDialog.Accepted:
                 self._trail.remove_poi(a)
-                save_trail(self._trail.paths, self._trail.pois)
+                save_trail(self._trail.paths, self._trail.pois, self._trail.painted_segments)
                 self._rebuild_data_list()
                 self._graph_renderer.render(
                     self._trail.paths, self._trail.pois, preserve_transform=True
@@ -1288,7 +1377,7 @@ class MainWindow(QMainWindow):
         self._settings.interval_ms = self._interval_input.value()
         self._settings.map_path = ""
         if self._graph_renderer.has_map:
-            pm = self._graph_renderer._map_pixmap
+            pm = self._graph_renderer.map_pixmap_for_save()
             if pm and not pm.isNull():
                 map_dir = SETTINGS_DIR / "maps"
                 map_dir.mkdir(parents=True, exist_ok=True)
@@ -1311,6 +1400,15 @@ class MainWindow(QMainWindow):
         self._heat_btn.setEnabled(has_data)
         self._fade_trail_check.setEnabled(has_data)
         self._poi_highlight_check.setEnabled(has_data and bool(self._trail.pois))
+        paint_ok = has_data and not is_recording
+        self._paint_trail_check.setEnabled(paint_ok)
+        if is_recording and self._paint_trail_check.isChecked():
+            self._paint_trail_check.setChecked(False)
+            self._graph_renderer.trail_paint_mode = False
+        self._paint_erase_check.setEnabled(
+            paint_ok and self._paint_trail_check.isChecked()
+        )
+        self._brush_slider.setEnabled(paint_ok and self._paint_trail_check.isChecked())
         self._min_distance_spin.setEnabled(not is_recording)
         self._zoom_fit_btn.setEnabled(has_data or self._graph_renderer.has_map)
         self._load_map_btn.setEnabled(not is_recording and not self._calibrating)
@@ -1345,7 +1443,10 @@ class MainWindow(QMainWindow):
         self._status_label.setStyleSheet(f"color: {color};")
 
     def closeEvent(self, event) -> None:
+        self._recording = False
+        self._bounds_sync_timer.stop()
         self._polling.stop()
+        self._graph_renderer.shutdown()
         self._reader.detach()
 
         if self._hotkey_service:
@@ -1353,6 +1454,6 @@ class MainWindow(QMainWindow):
 
         self._save_current_state_to_settings()
         save_settings(self._settings)
-        save_trail(self._trail.paths, self._trail.pois)
+        save_trail(self._trail.paths, self._trail.pois, self._trail.painted_segments)
 
         super().closeEvent(event)

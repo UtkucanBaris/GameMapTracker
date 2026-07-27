@@ -29,6 +29,89 @@ class POI:
         return f"({self.x:.1f}, {self.y:.1f})"
 
 
+def coerce_finite_point(value: object) -> TrailPoint | None:
+    if isinstance(value, TrailPoint):
+        x, y = value
+    elif isinstance(value, (list, tuple)) and len(value) >= 2:
+        try:
+            x, y = float(value[0]), float(value[1])
+        except (TypeError, ValueError):
+            return None
+    else:
+        return None
+    if not math.isfinite(x) or not math.isfinite(y):
+        return None
+    return TrailPoint(x, y)
+
+
+def sanitize_paths(paths: object) -> list[list[TrailPoint]]:
+    if not isinstance(paths, (list, tuple)):
+        return []
+    sanitized: list[list[TrailPoint]] = []
+    for path in paths:
+        if not isinstance(path, (list, tuple)):
+            continue
+        sanitized.append(
+            [point for raw_point in path if (point := coerce_finite_point(raw_point)) is not None]
+        )
+    return sanitized
+
+
+def coerce_finite_poi(value: object) -> POI | None:
+    if isinstance(value, POI):
+        x, y = value.x, value.y
+        desc, category = value.desc, value.category
+    elif isinstance(value, dict):
+        point = coerce_finite_point((value.get("x"), value.get("y")))
+        if point is None:
+            return None
+        x, y = point
+        desc = value.get("desc", "")
+        category = value.get("category", "")
+    else:
+        return None
+    if not math.isfinite(x) or not math.isfinite(y):
+        return None
+    return POI(
+        x,
+        y,
+        desc if isinstance(desc, str) else str(desc or ""),
+        category if isinstance(category, str) else str(category or ""),
+    )
+
+
+def sanitize_pois(pois: object) -> list[POI]:
+    if not isinstance(pois, (list, tuple)):
+        return []
+    return [
+        poi
+        for raw_poi in pois
+        if (poi := coerce_finite_poi(raw_poi)) is not None
+    ]
+
+
+def sanitize_trail_data(data: object) -> dict:
+    if not isinstance(data, dict):
+        return {"paths": [], "pois": [], "painted": []}
+    painted = data.get("painted", [])
+    return {
+        "paths": [
+            [[point.x, point.y] for point in path]
+            for path in sanitize_paths(data.get("paths", []))
+        ],
+        "pois": [
+            {
+                "x": poi.x,
+                "y": poi.y,
+                "desc": poi.desc,
+                "category": poi.category,
+            }
+            for poi in sanitize_pois(data.get("pois", []))
+        ],
+        "painted": painted if isinstance(painted, list) else [],
+    }
+
+
 MIN_DISTANCE = 28.0
 TELEPORT_THRESHOLD = 2000.0
 
@@ -39,12 +122,20 @@ class TrailModel:
     pois: list[POI] = field(default_factory=list)
     teleport_threshold: float = TELEPORT_THRESHOLD
     min_distance: float = MIN_DISTANCE
+    painted_segments: dict[tuple[int, int], str] = field(default_factory=dict)
     _poll_prev: tuple[float, float] | None = field(default=None, repr=False)
     _walk_since_add: float = field(default=0.0, repr=False)
 
     def reset_live_sampling(self) -> None:
         self._poll_prev = None
         self._walk_since_add = 0.0
+
+    def set_min_distance(self, value: float) -> None:
+        if not math.isfinite(value) or value < 0:
+            raise ValueError("min_distance must be finite and non-negative")
+        if value != self.min_distance:
+            self.min_distance = value
+            self._walk_since_add = 0.0
 
     def start_new_path(self) -> None:
         self.paths.append([])
@@ -113,10 +204,12 @@ class TrailModel:
         ]
 
     def add_poi(self, x: float, y: float, desc: str = "", category: str = "") -> None:
+        if not math.isfinite(x) or not math.isfinite(y):
+            return
         self.pois.append(POI(x, y, desc, category))
 
     def update_poi(self, idx: int, x: float, y: float, desc: str, category: str) -> None:
-        if 0 <= idx < len(self.pois):
+        if 0 <= idx < len(self.pois) and math.isfinite(x) and math.isfinite(y):
             self.pois[idx] = POI(x, y, desc, category)
 
     @property
@@ -146,13 +239,54 @@ class TrailModel:
         if self.paths and not self.paths[-1]:
             self.paths.pop()
 
-    def load(self, paths: list[list[TrailPoint]], pois: list[POI]) -> None:
-        self.paths = paths
-        self.pois = pois
+    def paint_segment(self, path_idx: int, seg_idx: int, category: str) -> None:
+        if category:
+            self.painted_segments[(path_idx, seg_idx)] = category
+
+    def erase_segment(self, path_idx: int, seg_idx: int) -> None:
+        self.painted_segments.pop((path_idx, seg_idx), None)
+
+    def clear_painted_segments(self) -> None:
+        self.painted_segments.clear()
+
+    @staticmethod
+    def painted_to_json(painted: dict[tuple[int, int], str]) -> list[dict]:
+        return [
+            {"path": p, "seg": s, "category": cat}
+            for (p, s), cat in sorted(painted.items())
+        ]
+
+    @staticmethod
+    def painted_from_json(rows: list) -> dict[tuple[int, int], str]:
+        out: dict[tuple[int, int], str] = {}
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            try:
+                p = int(row.get("path", -1))
+                s = int(row.get("seg", -1))
+            except (TypeError, ValueError):
+                continue
+            cat = str(row.get("category", ""))
+            if p >= 0 and s >= 0:
+                out[(p, s)] = cat
+        return out
+
+    def load(
+        self,
+        paths: list[list[TrailPoint]],
+        pois: list[POI],
+        painted: dict[tuple[int, int], str] | None = None,
+    ) -> None:
+        self.paths = sanitize_paths(paths)
+        self.pois = sanitize_pois(pois)
+        self.painted_segments = painted if painted is not None else {}
+        self.reset_live_sampling()
 
     def clear(self) -> None:
         self.paths.clear()
         self.pois.clear()
+        self.painted_segments.clear()
         self.reset_live_sampling()
 
 

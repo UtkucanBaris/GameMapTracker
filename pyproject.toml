@@ -8,3 +8,36 @@ dependencies = ["PySide6"]
 
 [project.scripts]
 gamemaptracker = "main:main"
+
+[dependency-groups]
+dev = [
+    "mypy>=2.3.0",
+    "pytest>=9.1.1",
+    "pytest-qt>=4.5.0",
+    "ruff>=0.16.0",
+]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
+
+[tool.mypy]
+python_version = "3.12"
+ignore_missing_imports = true
+check_untyped_defs = true
+warn_unused_ignores = true
+files = [
+    "trail_model.py",
+    "settings_service.py",
+    "export_service.py",
+    "polling_service.py",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "qt: tests requiring the Qt application event loop",
+]

@@ -2,6 +2,7 @@ from __future__ import annotations
 import ctypes
 import sys
 from ctypes import wintypes
+from collections.abc import Callable
 
 from PySide6.QtCore import QAbstractNativeEventFilter
 from PySide6.QtWidgets import QApplication
@@ -36,13 +37,13 @@ class Win32HotkeyService(QAbstractNativeEventFilter):
     def __init__(self, parent_widget):
         super().__init__()
         self._parent = parent_widget
-        self._callbacks: dict[int, callable] = {}
+        self._callbacks: dict[int, Callable[[], None]] = {}
         self._next_id = 0xB001
         app = QApplication.instance()
         if app:
             app.installNativeEventFilter(self)
 
-    def register(self, key: int, callback: callable) -> bool:
+    def register(self, key: int, callback: Callable[[], None]) -> bool:
         if sys.platform != "win32" or user32 is None:
             return False
         hwnd = int(self._parent.winId())

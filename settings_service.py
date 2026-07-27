@@ -1,8 +1,13 @@
 import json
 import math
 import os
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
+from typing import Any, TypeAlias
+
+
+JsonObject: TypeAlias = dict[str, Any]
 
 
 _UNSET = float("nan")
@@ -50,7 +55,7 @@ class AppSettings:
     interval_ms: int = 500
     map_path: str = ""
     calibration: MapCalibration = field(default_factory=MapCalibration)
-    profiles: dict = field(default_factory=dict)
+    profiles: dict[str, JsonObject] = field(default_factory=dict)
     active_profile: str = ""
 
 
@@ -59,29 +64,49 @@ SETTINGS_PATH = SETTINGS_DIR / "settings.json"
 TRAIL_PATH = SETTINGS_DIR / "trail.json"
 
 
-def save_trail(paths: list, pois: list) -> None:
+def save_trail(
+    paths: Sequence[object],
+    pois: Sequence[object],
+    painted: Mapping[tuple[int, int], str] | None = None,
+) -> None:
     try:
         SETTINGS_DIR.mkdir(parents=True, exist_ok=True)
+        from trail_model import TrailModel, sanitize_paths, sanitize_pois
+
+        clean_paths = sanitize_paths(paths)
+        clean_pois = sanitize_pois(pois)
         data = {
-            "paths": [[[float(v) for v in pt] for pt in path] for path in paths],
-            "pois": [{"x": p.x, "y": p.y, "desc": p.desc, "category": p.category} for p in pois],
+            "paths": [[[float(v) for v in pt] for pt in path] for path in clean_paths],
+            "pois": [
+                {"x": p.x, "y": p.y, "desc": p.desc, "category": p.category}
+                for p in clean_pois
+            ],
         }
-        TRAIL_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        if painted:
+            data["painted"] = TrailModel.painted_to_json(dict(painted))
+        TRAIL_PATH.write_text(
+            json.dumps(data, indent=2, allow_nan=False),
+            encoding="utf-8",
+        )
     except Exception as e:
         import sys
         print(f"Trail save error: {e}", file=sys.stderr)
 
 
-def load_trail() -> dict | None:
+def load_trail() -> JsonObject | None:
     try:
         if TRAIL_PATH.exists():
-            return json.loads(TRAIL_PATH.read_text(encoding="utf-8"))
+            from trail_model import sanitize_trail_data
+
+            return sanitize_trail_data(
+                json.loads(TRAIL_PATH.read_text(encoding="utf-8"))
+            )
     except Exception:
         pass
     return None
 
 
-def _dict_to_calib(d: dict) -> MapCalibration:
+def _dict_to_calib(d: Mapping[str, Any]) -> MapCalibration:
     return MapCalibration(
         point1_gx=d.get("point1_gx", _UNSET),
         point1_gy=d.get("point1_gy", _UNSET),
@@ -94,7 +119,7 @@ def _dict_to_calib(d: dict) -> MapCalibration:
     )
 
 
-def _profile_to_dict(settings: AppSettings) -> dict:
+def _profile_to_dict(settings: AppSettings) -> JsonObject:
     return {
         "process_name": settings.process_name,
         "x_address": settings.x_address,
@@ -114,7 +139,7 @@ def _profile_to_dict(settings: AppSettings) -> dict:
     }
 
 
-def _dict_to_settings(profile: dict) -> AppSettings:
+def _dict_to_settings(profile: Mapping[str, Any]) -> AppSettings:
     calib = profile.get("calibration", {})
     return AppSettings(
         process_name=profile.get("process_name", "Exanima.exe"),

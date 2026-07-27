@@ -3,7 +3,7 @@ import ctypes
 import math
 import struct
 import sys
-from ctypes import c_void_p, c_size_t, c_ulong, c_uint, c_wchar, c_long, c_int, byref, create_string_buffer, sizeof
+from ctypes import c_void_p, c_size_t, c_ulong, c_wchar, c_long, c_int, byref, create_string_buffer, sizeof
 from dataclasses import dataclass
 from enum import Enum, auto
 
@@ -104,6 +104,22 @@ class MemoryReader:
     @property
     def has_handle(self) -> bool:
         return self._handle is not None
+
+    @property
+    def process_name(self) -> str:
+        return self._process_name
+
+    @property
+    def pid(self) -> int | None:
+        return self._pid
+
+    @property
+    def module_base(self) -> int | None:
+        return self._module_base
+
+    @property
+    def last_error(self) -> int:
+        return self._last_error
 
     def set_process_name(self, name: str) -> None:
         self._process_name = name

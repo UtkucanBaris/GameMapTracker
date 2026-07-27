@@ -1,4 +1,5 @@
 from __future__ import annotations
+import math
 from dataclasses import dataclass, field
 from PySide6.QtGui import QPainter, QImage, QColor
 from trail_model import TrailPoint, POI
@@ -58,6 +59,8 @@ def import_text(filepath: str) -> ExportResult:
                     y = float(parts[1])
                 except ValueError:
                     continue
+                if not math.isfinite(x) or not math.isfinite(y):
+                    continue
                 desc = parts[2] if len(parts) > 2 else ""
                 category = parts[3] if len(parts) > 3 else ""
                 if in_poi:
@@ -72,13 +75,13 @@ def import_text(filepath: str) -> ExportResult:
 
 
 def export_png(scene, filepath: str, width: int, height: int) -> None:
-    image = QImage(width, height, QImage.Format_ARGB32_Premultiplied)
+    image = QImage(width, height, QImage.Format.Format_ARGB32_Premultiplied)
     image.fill(QColor(0xF0, 0xF0, 0xF0))
     painter = QPainter(image)
     try:
-        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         scene.render(painter)
     finally:
         painter.end()
-    if not image.save(filepath, "PNG"):
+    if not image.save(filepath, b"PNG"):
         raise RuntimeError(f"Failed to save PNG to {filepath}")
